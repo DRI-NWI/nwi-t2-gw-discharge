@@ -21,6 +21,7 @@ import pandas as pd
 import geopandas as gpd
 import numpy as np
 import datetime
+import requests
 
 import ee_bmm.inputs as inputs
 import ee_bmm.utils as utils
@@ -68,12 +69,27 @@ def main(ini_path=None):
     phreat_nm = phreat.split("\\")[-1]
     shp_nm = phreat_nm.split(".")[0]
 
+    # landsat NDVI harmonization type
+    harmonization_typ = ini['IMAGES']['harmonization_type']
+    
+    # local output path for getDownloadUrl export
+    # local output path/locatin where zonal stats are directly exported to
+    local_o_path = ini['INPUTS']['local_output_path']
+    out_stats_path = os.path.join(local_o_path, f'stats_{harmonization_typ}')
+    if not os.path.isdir(out_stats_path):
+        os.mkdir(out_stats_path)
+
     # attribute to use as the unique identifier, default FID
     zone_nm = ini['INPUTS']['zone_field']
     
     # HA boundary
     ha = ini['INPUTS']['hyd_area']
 
+    # start and end years
+    start_yr = ini['INPUTS']['start_year']
+    end_yr = ini['INPUTS']['end_year']
+    year_filter_list = list(range(start_yr, end_yr+1))
+    
     # Google Drive folder
     gdrive = ini['ZONAL_STATS']['output_folder']
 
@@ -85,7 +101,8 @@ def main(ini_path=None):
     
     # asset ID location or cloud storage location
     output_path = ini['IMAGES']['export_dest']
-
+    # output_path = 'projects/dri-nwi-425400/assets/bmm' # hard code image collection (and registered COGs, from cloud storage) paths
+    
     # water index image collection id
     ndwi_id = ini['IMAGES']['water_index_id']
 
@@ -97,12 +114,18 @@ def main(ini_path=None):
     band_nm_list = ini['IMAGES']['band_list']
 
     # asset ID location or cloud storage location
-    output_path_n = f"{output_path}/{ha}"
+    output_path_n = f"{output_path}/{ha}_{harmonization_typ}"
 
     # function to calc area of feature
     def calcArea(ftr):
         return ftr.set({
-            'area_ee_acres': ftr.geometry().area().divide(4047)
+            'area_ee_acres': ftr.geometry().area().divide(4046.86)
+        })
+
+    # need to convert units on replacement rate column
+    def converUnit(ftr):
+        return ftr.set({
+            'rplc_rt': ee.Number(ftr.get('rplc_rt_old')).multiply(304.8)
         })
     
     # Beamer Minor image collection
@@ -146,33 +169,55 @@ def main(ini_path=None):
     ee_crs = ee_json.get('crs')
     ee_transform = ee.List(ee_json.get('transform'))
 
-    # read phreatophyte shapefile geometry into EE feature collection and modify as needed
-    df = gpd.read_file(phreat).to_crs(epsg=4326)
-    df[zone_nm] = df.index
+    # if shapefile geometries are too complex, creation of an feature collection from manual upload is required
+    # try: 
+    #     phreat_col_pre = (
+    #         ee.FeatureCollection('users/bminor-dri/NWI/Task2_groundwater_discharge/shapefiles/HA117_Fish_Lake_Valley')
+    #         # ee.FeatureCollection('projects/ee-bminor/assets/NWI/HA101_CarsonDesert_phreat')
+    #         # ee.FeatureCollection('projects/ee-bminor/assets/NWI/HA173B_Railroad_Valley_North')
+    #             .select(['FID2', 'rplc_rt', 'scale_fctr', 'bsnAv_flag'], ['FID2', 'rplc_rt_old', 'scale_fctr', 'bsnAv_flag'])
+    #             .map(converUnit)
+    #     )
+    # except Exception as e:
+    #     print(e)
 
-    # Need to first convert replacement rate field units to millimeters before making the feature collection
-    if replacement_etg_flag:
+    # read phreatophyte shapefile geometry into EE feature collection and modify as needed (above method for complex geometries if it fails)
+    try:
+        df = gpd.read_file(phreat).to_crs(epsg=4326)
+        df = df.loc[df['HA_number'] == ha]
+        if len(df) == 0:
+            logging.error(f'      No phreatophyte boundary found for HA {ha}, make sure there is a feature available in the shapefile')
 
-        for band_nm in band_nm_list:
-            if not (band_nm == 'etg' or band_nm == 'etg_lci' or band_nm == 'etg_uci' or band_nm == 'etg_lpi' or band_nm == 'etg_upi' or band_nm == 'etg_adj' or band_nm == 'etg_lci_adj' or band_nm == 'etg_uci_adj' or band_nm == 'etg_lpi_adj' or band_nm == 'etg_upi_adj'):
-                print(f'Replacement rates only apply to ETg images, skipping {band_nm}')
-                continue
-            
-            # shapefile replacement ETg rate burn field
-            burn_field = burn_nm_dict[band_nm]
-
-            # convert the units from feet to millimeters
-            df[burn_field] = df[burn_field] * 304.8
+        df[zone_nm] = df.index
     
-    # convert dataframe to json for earth engine feature collection
-    geo_json = df.to_json()
-    phreat_col_pre = ee.FeatureCollection(json.loads(geo_json))
+        # Need to first convert replacement rate field units to millimeters before making the feature collection
+        if replacement_etg_flag:
     
+            for band_nm in band_nm_list:
+                if not (band_nm == 'etg' or band_nm == 'etg_lci' or band_nm == 'etg_uci' or band_nm == 'etg_adj' or band_nm == 'etg_lci_adj' or band_nm == 'etg_uci_adj'):
+                    print(f'Replacement rates only apply to ETg images, skipping {band_nm}')
+                    continue
+                
+                # shapefile replacement ETg rate burn field
+                burn_field = burn_nm_dict[band_nm]
+    
+                # convert the units from feet to millimeters
+                df[burn_field] = df[burn_field] * 304.8
+        
+        # convert dataframe to json for earth engine feature collection
+        geo_json = df.to_json()
+        phreat_col_pre = ee.FeatureCollection(json.loads(geo_json))
+    except Exception as e:
+        print(e)
+
+
     phreat_col = phreat_col_pre.map(calcArea)
+
     
     # Beamer Minor long term median image
     bmm_med = (
         bmm_col
+            .filter(ee.Filter.inList('year', year_filter_list))
             .median()
             .set('year', 'long_term_median')
     )
@@ -200,7 +245,7 @@ def main(ini_path=None):
         
         for band_nm in band_nm_list:
 
-            if not (band_nm == 'etg' or band_nm == 'etg_lci' or band_nm == 'etg_uci' or band_nm == 'etg_lpi' or band_nm == 'etg_upi' or band_nm == 'etg_adj' or band_nm == 'etg_lci_adj' or band_nm == 'etg_uci_adj' or band_nm == 'etg_lpi_adj' or band_nm == 'etg_upi_adj'):
+            if not (band_nm == 'etg' or band_nm == 'etg_lci' or band_nm == 'etg_uci' or band_nm == 'etg_adj' or band_nm == 'etg_lci_adj' or band_nm == 'etg_uci_adj'):
                 print(f'Replacement rates only apply to ETg images, skipping {band_nm}')
                 continue 
             
@@ -235,7 +280,7 @@ def main(ini_path=None):
             )
     
             # check the size of the filtered feature collections to see if place-based rates, scaling factors, and/or basin-wide average flags are provided
-            scl_ftr_coll_size = scl_ftr_coll.size().getInfo() 
+            scl_ftr_coll_size = scl_ftr_coll.size().getInfo()
             plc_ftr_coll_size = plc_ftr_coll.size().getInfo()
             bsnAv_burn_ftr_coll_size = bsnAv_burn_ftr_coll.size().getInfo()
     
@@ -522,20 +567,28 @@ def main(ini_path=None):
             else:
                 logging.error(f"\nerror finding the ETg scaling factors, place-based replacement ETg values, and/or basin-wide average replacement ETg rate flags in the shapefile, stop")
                 continue
+
+            # use a constant image to burn in values for missing pixels (most often associated saturated pixels in playas/bare soil areas, e.g., Carson Desert)
+            fill_img = ee.Image.constant(min_etg_thresh_mm).rename([band_nm]).updateMask(out_burned_img.mask().Not())
+            out_burned_img_filled = ee.ImageCollection([out_burned_img, fill_img]).mosaic()
+            
+            out_burned_img_filled = out_burned_img_filled.where(out_burned_img_filled.select(band_nm).lt(min_etg_thresh_mm), min_etg_thresh_mm)
             
             # add the burned image band back into the stack
             bmm_med_sub = (
                 bmm_med_sub
-                    .addBands(out_burned_img)
+                    .addBands(out_burned_img_filled)
             )
     else:
+
         bmm_med_sub = bmm_med
     
     def removGeom(ftr):
         return ftr.setGeometry(None)
 
-    logging.info(f"\nExporting zonal stats of Beamer-Minor long-term ETg images to Google Drive")
-    logging.info(f"\nPlace-based replacement ETg flag used: {replacement_etg_flag}")
+    logging.info(f"\nExporting zonal stats of Beamer-Minor long-term ETg images {harmonization_typ} to Google Drive")
+    logging.info(f"\nReplacement ETg flag used: {replacement_etg_flag}")
+    logging.info(f"\nLandsat Harmonization Type: {harmonization_typ}")
     logging.info(f"\nPhreatophyte boundary: {phreat_nm}")
     logging.info(f"\nPhreatophyte zone field: {zone_nm}")
     logging.info(f"\nHA number: {ha}")
@@ -549,25 +602,51 @@ def main(ini_path=None):
                     ee.Reducer.mean()
                         .combine(ee.Reducer.count(), '', True)
                 ),
-                crs= ee_crs,
-                crsTransform= ee_transform,
+                crs=ee_crs,
+                crsTransform=ee_transform,
                 tileScale=8
             )
             .map(removGeom)
     )
+
+    # output filename with start/end years
+    out_filename = f'BMM_etg_{shp_nm}_regions_{harmonization_typ}_{start_yr}_{end_yr}'
     
-    out_table = ee.batch.Export.table.toDrive(**{
-      'collection': stats_coll,
-      'description': f'{ha}_BMM_TableExportRegions',
-      'folder': gdrive,
-      'fileNamePrefix': f'BMM_etg_summary_HA_{ha}_{shp_nm}_regions',
-      'fileFormat': 'CSV',
-      'selectors': [zone_nm, 'area_ee_acres', 'ndvi_count', 'ndvi_mean', 'et_star_mean', 'eto_mean', 'pr_mean', 'eta_mean', 'eta_lci_mean', 
-                            'eta_uci_mean', 'etg_mean', 'etg_lci_mean', 'etg_uci_mean', 'etg_adj_mean', 'etg_lci_adj_mean', 'etg_uci_adj_mean'],
-    })
-    out_table.start()
-     
-    logging.info(f"\ntask started for HA: {ha}, phreatophyte shapefile: {phreat_nm}")
+    # download/export stats directly to local folder
+    try:
+        downloadUrlStats = stats_coll.getDownloadURL(**{
+            'filetype': 'CSV',
+            'filename': out_filename,
+            'selectors': [zone_nm, 'area_ee_acres', 'ndvi_count', 'ndvi_mean', 'et_star_mean', 'eto_mean', 'pr_mean', 'eta_mean', 'eta_lci_mean', 
+                                   'eta_uci_mean', 'etg_mean', 'etg_lci_mean', 'etg_uci_mean', 'etg_adj_mean', 'etg_lci_adj_mean', 'etg_uci_adj_mean'],
+            # 'selectors': ['FID2', 'area_ee_acres', 'ndvi_count', 'ndvi_mean', 'et_star_mean', 'eto_mean', 'pr_mean', 'eta_mean', 'eta_lci_mean', 
+            #                       'eta_uci_mean', 'etg_mean', 'etg_lci_mean', 'etg_uci_mean', 'etg_adj_mean', 'etg_lci_adj_mean', 'etg_uci_adj_mean'], # these selectors were for CarsonDesert101 run
+        })
+        responseStats = requests.get(downloadUrlStats)
+        if responseStats.status_code == 200:
+            with open(os.path.join(out_stats_path, f'{out_filename}.csv'), 'wb') as f:
+                f.write(responseStats.content)
+            print(f"zonal stats table downloaded successfully to the 'stats_{harmonization_typ}' folder")
+        else:
+            print(f"Failed to download zonal stats table. Status code: {responseStats.status_code}")
+        logging.info(f"\ntable exported for HA: {ha}, phreatophyte shapefile: {phreat_nm}, location: {out_stats_path}")
+
+    except Exception as e:
+        print('attempt to use getDownloadURL export failed, submitting batch table export instead')
+        # batch table export
+        out_table = ee.batch.Export.table.toDrive(**{
+          'collection': stats_coll,
+          'description': f'{ha}_BMM_TableExportRegions_{harmonization_typ}',
+          'folder': gdrive,
+          'fileNamePrefix': out_filename,
+          'fileFormat': 'CSV',
+          'selectors': [zone_nm, 'area_ee_acres', 'ndvi_count', 'ndvi_mean', 'et_star_mean', 'eto_mean', 'pr_mean', 'eta_mean', 'eta_lci_mean', 
+                                'eta_uci_mean', 'etg_mean', 'etg_lci_mean', 'etg_uci_mean', 'etg_adj_mean', 'etg_lci_adj_mean', 'etg_uci_adj_mean'],
+          # 'selectors': ['FID2', 'area_ee_acres', 'ndvi_count', 'ndvi_mean', 'et_star_mean', 'eto_mean', 'pr_mean', 'eta_mean', 'eta_lci_mean', 
+          #                       'eta_uci_mean', 'etg_mean', 'etg_lci_mean', 'etg_uci_mean', 'etg_adj_mean', 'etg_lci_adj_mean', 'etg_uci_adj_mean'],
+        })
+        out_table.start() 
+        logging.info(f"\ntask started for HA: {ha}, phreatophyte shapefile: {phreat_nm}")
         
 
 def arg_parse():

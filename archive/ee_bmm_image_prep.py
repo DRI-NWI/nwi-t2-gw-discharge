@@ -91,6 +91,23 @@ def main(ini_path=None):
 
     # BMM regression version for image properties
     bmm_r_vers = ini['IMAGES']['bmm_regress_vers']
+
+    # regression stats/params for calculating confidence intervals (based on the BMM version)
+    # B0, B1, A=Tval*RSE, mean of x, SSE, inverse of n, 1+inverse of n
+    param_dict = {
+        'v2p1p3': [-0.035, 1.1385, 0.12253174979396549, 0.21018529657667032, 0.31721084424075263, 0.01639344262295082, 1.0163934426229508] # confidence/prediction interval fix 
+        # 'v2p2p1': [],
+    }
+    # define params/stats based on dictionary above
+    B0 = param_dict[bmm_r_vers][0]
+    B1 = param_dict[bmm_r_vers][1]
+    bmm_eqn = f'ET*={B0} + {B1}NDVI'
+    A = param_dict[bmm_r_vers][2]
+    u_x = param_dict[bmm_r_vers][3]
+    Sxx = param_dict[bmm_r_vers][4]
+    inv_n = param_dict[bmm_r_vers][5] # used for confidence intervals
+    one_plus_inv_n = param_dict[bmm_r_vers][6] # used for prediction intervals
+    logging.info(f'BMM model version: {bmm_r_vers}, ET* = {B0} + {B1}NDVI')
     
     # asset ID location or cloud storage location
     output_path = ini['IMAGES']['export_dest']
@@ -121,7 +138,7 @@ def main(ini_path=None):
     shadow_flag = True
     snow_flag   = True
     
-    # Applies scale factors to Landsat Collection 2 Tier 2 image collection
+    # Applies scale factors to Landsat Collection 2 Tier 1 image collection
     def applyScaleFactors(img):
         opticalBands = img.select('SR_B.').multiply(0.0000275).add(-0.2)
         thermalBands = img.select('ST_B.*').multiply(0.00341802).add(149.0)
@@ -151,8 +168,8 @@ def main(ini_path=None):
     def dateProperties(img):
         return (
             img
-                .set('year', ee.Number(ee.Date(img.get('system:time_start')).get('year')))
-                .copyProperties(img, ['system:index', 'system:time_start', 'system:time_end'])
+                .set('year', ee.Number.parse(ee.String(img.get('DATE_ACQUIRED')).slice(0, 4)).toInt())
+                .copyProperties(img)
         )
     
     def srNDVI(img):
@@ -161,8 +178,8 @@ def main(ini_path=None):
                 .select(['red','nir'])
                 .expression('((b(1) - b(0)) / (b(1) + b(0)))')
                 .rename(['ndvi'])
-                .set('year', ee.Number(ee.Date(img.get('system:time_start')).get('year')))
-                .copyProperties(img, ['system_index', 'system:time_start']))
+                .set('year', ee.Number.parse(ee.String(img.get('DATE_ACQUIRED')).slice(0, 4)).toInt())
+                .copyProperties(img))
         )
     
     # USGS SR OLI 2 ETM conversions (red, nir, QA_PIXEL)
@@ -175,7 +192,7 @@ def main(ini_path=None):
             image
                 .multiply(m)
                 .add(b)
-                .copyProperties(image, ['system:index', 'system:time_start'])
+                .copyProperties(image)
         )
     
     # build collection of median NDVI composites
@@ -192,16 +209,48 @@ def main(ini_path=None):
                 })
         )
 
+    # version history
     # ET Star images from NDVI ET* = -0.035 + 1.1097(NDVI), LCI, UCI, LPI, and UPI 2024-05-24
     # ET Star images from NDVI ET* = -0.035 + 1.1316(NDVI), LCI, UCI, LPI, and UPI 2024-10-22 (BMM v2p1p0)
     # ET Star images from NDVI ET* = -0.035 + 1.1343(NDVI), LCI, UCI, LPI, and UPI 2025-01-02 (BMM v2p1p1) added EGBRX and PKL sites from DeMeo et al. (2003), added CC mesquite site, LONS and ERG-2 spring sites
     # ET Star images from NDVI ET* = -0.035 + 1.1385(NDVI), LCI, UCI, LPI, and UPI 2025-02-06 (BMM v2p1p2) implemented QC flags for EC/BR flux data following AmeriFlux guidelines and Garcia et al. (2015)
+    # ET Star images from NDVI ET* = -0.035 + 1.1385(NDVI), LCI, UCI, LPI, and UPI 2026-03-05 (BMM v2p1p3) update/fix for confidence and prediction interval estimation
     def buildETStar(img):
+
+        # apply predictive equation to ndvi image
+        yhat = (
+            img
+                .select('ndvi')
+                .multiply(ee.Number(B1))
+                .add(ee.Number(B0))
+        )
+
+        # confidence interval term
+        term_ci = (
+            img
+                .select('ndvi')
+                .subtract(ee.Number(u_x))
+                .pow(2)
+                .divide(ee.Number(Sxx))
+                .add(ee.Number(inv_n))
+                .sqrt()
+        )
+
+        # prediction interval term
+        # term_pi = (
+        #     img
+        #         .select('ndvi')
+        #         .subtract(ee.Number(u_x))
+        #         .pow(2)
+        #         .divide(ee.Number(Sxx))
+        #         .add(one_plus_inv_n)
+        #         .sqrt()
+        
         return (
             img
-                .addBands(img.select('ndvi').multiply(ee.Number(1.1385)).add(ee.Number(-0.035)))
-                .addBands(img.select('ndvi').multiply(ee.Number(1.0887)).add(ee.Number(-0.0436)))
-                .addBands(img.select('ndvi').multiply(ee.Number(1.1882)).add(ee.Number(-0.0264)))
+                .addBands(yhat)
+                .addBands(yhat.subtract(term_ci.multiply(ee.Number(A)))) # lower 90% confidence interval
+                .addBands(yhat.add(term_ci.multiply(ee.Number(A)))) # upper 90% confidence interval 
                 .rename(['ndvi', 'et_star', 'et_star_lci', 'et_star_uci'])
         )
 
@@ -266,6 +315,7 @@ def main(ini_path=None):
 
     # feature collection filtered to the basin of interest
     phreat_col = ee.FeatureCollection(json.loads(geo_json))
+    # phreat_col = ee.FeatureCollection('projects/ee-bminor/assets/NWI/HA101_CarsonDesert_phreat')
 
     # gridMET grid feature collection and set the centroid property
     grids = ee.FeatureCollection('users/bminor/gridmet_grids').map(setCent)
@@ -408,7 +458,7 @@ def main(ini_path=None):
     
     # merge L5, L7, L8, and L9 collections
     landsat_col = ee.ImageCollection([])
-    landsat_col = ee.ImageCollection(landsat_col.merge(landsat5.merge(landsat7.merge(landsat8).merge(landsat9))))
+    landsat_col = ee.ImageCollection(landsat_col.merge(landsat5.merge(landsat7.merge(landsat8.merge(landsat9)))))
 
     # cloud masking, ndvi calc, set date properties mapping over the merged collection    
     ndvi_col = (
@@ -417,7 +467,7 @@ def main(ini_path=None):
             .map(srNDVI)
             .map(dateProperties)
     )
-
+    
     # CRS and Transform for export
     projection = ndvi_col.first().projection()
     ee_json = ee.Dictionary(ee.Algorithms.Describe(projection))
@@ -486,7 +536,7 @@ def main(ini_path=None):
                 .rename(['ndvi', 'et_star', 'et_star_lci', 'et_star_uci', 'eto', 'pr'])
         )
 
-        # calculate ETa and ETg bands, along with all CI and PI bands
+        # calculate ETa and ETg bands, along with all CI bands
         out_img = (
             merged_img
                 .addBands((merged_img.select('pr').add(merged_img.select('et_star').multiply(merged_img.select('eto').subtract(merged_img.select('pr'))))).toShort()) # signed 16-bit integer
@@ -499,6 +549,7 @@ def main(ini_path=None):
                 .select(['ndvi', 'et_star', 'eto', 'pr', 'eta', 'eta_lci', 'eta_uci', 'etg', 'etg_lci', 'etg_uci'])
                 .set({
                     'bmm_regression_version': bmm_r_vers,
+                    'bmm_regression_equation': bmm_eqn,
                     'date_ingested': datetime.datetime.now().strftime('%Y-%m-%d'),
                     'gridmet_cell_count': grid_c.get('eto_count'),
                     'gridmet_buffer_flag': g_buf,
@@ -508,7 +559,7 @@ def main(ini_path=None):
                 })
         )
 
-        # set floor on etg values using the user-specified threshold. Default is 0.05 ft (approx. 15.24 mm)
+        # set floor on etg values using the user-specified threshold. Default is 0.01 ft (approx. 3.048 mm)
         # leaving these adjusted bands as floats b/c of low values
         out_img = (
             out_img

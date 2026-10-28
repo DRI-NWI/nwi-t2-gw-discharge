@@ -120,6 +120,7 @@ def parse_inputs(ini, section='INPUTS'):
         ['gcloud_project_id', 'gcloud_project_id', str],
         ['zone_shp_path', 'zone_shp_path', str],
         ['zone_field', 'zone_field', str],
+        ['local_output_path', 'local_output_path', str],
         ['hyd_area', 'hyd_area', str],
         ['start_year', 'start_year', int],
         ['end_year', 'end_year', int],
@@ -224,18 +225,30 @@ def parse_images(ini, section='IMAGES'):
     # DEADBEEF - What should the default Landsat products be?
     param_list = [
         ['bmm_regress_vers', 'bmm_regress_vers', str],
+        ['image_storage_location', 'image_storage_location', str],
         ['export_dest', 'export_dest', str],
+        ['harmonization_type', 'harmonization_type', str],
         ['band_list', 'band_list', list],
         ['water_index_id', 'water_index_id', str],
     ]
     for input_name, output_name, get_type in param_list:
         get_param(ini, section, input_name, output_name, get_type)
 
+    if ini[section]['bmm_regress_vers']:
+        options = ['v2p1p3', 'v2p2p1', 'v2p3p1']
+        ini[section]['bmm_regress_vers'] = ini[section]['bmm_regress_vers']
+        if ini[section]['bmm_regress_vers'] not in options:
+            logging.error(
+                '\nERROR: Invalid Beamer-Minor Method version specified: {}\n'
+                '  Must be: {}'.format(
+                    ini[section]['bmm_regress_vers'], ', '.join(options)))
+            sys.exit()
+    
     if ini[section]['band_list']:
         ini[section]['band_list'] = [x.lstrip() for x in ini[section]['band_list'].split(',')]
 
     param_list = [
-        ['min_etg_threshold', 'min_etg_threshold', float, 0.05],
+        ['min_etg_threshold', 'min_etg_threshold', float, 0.01],
     ]
     for input_name, output_name, get_type, default in param_list:
         get_param(ini, section, input_name, output_name, get_type, default)
